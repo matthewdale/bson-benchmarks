@@ -1,0 +1,4 @@
+fixtures/*.json
+fixtures/*.bson
+rust-decoder/target
+fixture-generator/target

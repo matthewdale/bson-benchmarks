@@ -38,7 +38,7 @@ if command -v hyperfine &> /dev/null; then
         --warmup 3 \
         --runs 10 \
         --export-markdown benchmark_results.md \
-        --command-name "Go (mongo-driver v1.11.0)" \
+        --command-name "Go (mongo-driver v2.4.1)" \
         './go-decoder/decoder < fixtures/test_data.bson > /dev/null' \
         --command-name "Rust (bson crate)" \
         './rust-decoder/target/release/rust-decoder < fixtures/test_data.bson > /dev/null'
@@ -49,7 +49,7 @@ else
     echo "hyperfine not found, using 'time' command..."
     echo ""
 
-    echo "--- Go (mongo-driver v1.11.0) ---"
+    echo "--- Go (mongo-driver v2.4.1) ---"
     time ./go-decoder/decoder < fixtures/test_data.bson > /dev/null
     echo ""
 

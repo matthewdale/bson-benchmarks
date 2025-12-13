@@ -35,15 +35,14 @@ type bsonFields struct {
 	Ns                       namespace `bson:"ns"`
 }
 
-type result struct {
-	ID       bson.RawValue `bson:"_id,omitempty"`
-	Op       string        `bson:"op"`
-	Document bson.Raw      `bson:"document,omitempty"`
-	Before   bson.Raw      `bson:"before"`
+type metaDoc struct {
+	Op     string        `bson:"op"`
+	ID     bson.RawValue `bson:"_id,omitempty"`
+	Before bson.Raw      `bson:"before,omitempty"`
 }
 
-func makeEventDocument(fields bsonFields) (result, error) {
-	var res result
+func makeMetaDocument(fields bsonFields) (metaDoc, error) {
+	var res metaDoc
 	if fields.FullDocumentBeforeChange != nil {
 		res.Before = fields.FullDocumentBeforeChange
 	}
@@ -56,12 +55,11 @@ func makeEventDocument(fields bsonFields) (result, error) {
 		case "insert":
 			res.Op = "c"
 		}
-		res.Document = fields.FullDocument
 	case "delete":
 		res.Op = "d"
 		res.ID = fields.DocumentKey.ID
 	default:
-		return result{}, fmt.Errorf("unknown operation: %q", fields.OperationType)
+		return metaDoc{}, fmt.Errorf("unknown operation: %q", fields.OperationType)
 	}
 
 	return res, nil
@@ -73,13 +71,13 @@ func main() {
 	dec := bson.NewDecoder(bson.NewDocumentReader(os.Stdin))
 
 	buf := new(bytes.Buffer)
-	enc := bson.NewEncoder(&JSONValueWriter{
+	enc := bson.NewEncoder(&SanitizedValueWriter{
 		ValueWriter: bson.NewExtJSONValueWriter(buf, false, false),
 	})
 
 	for {
-		var res bsonFields
-		err := dec.Decode(&res)
+		var fields bsonFields
+		err := dec.Decode(&fields)
 		if err == io.EOF {
 			break
 		}
@@ -88,17 +86,46 @@ func main() {
 			os.Exit(1)
 		}
 
-		doc, err := makeEventDocument(res)
+		meta, err := makeMetaDocument(fields)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error creating event document: %v\n", err)
 			os.Exit(1)
 		}
 
-		err = enc.Encode(doc)
+		// If the operation is a delete, we're just going to add the "_meta"
+		// field. Otherwise, we need to add the fields from "FullDocument".
+		if fields.OperationType == "delete" {
+			buf.WriteByte('{')
+		} else {
+			err := enc.Encode(fields.FullDocument)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error marshaling fullDocument to Extended JSON: %v\n", err)
+				os.Exit(1)
+			}
+			idx := bytes.LastIndexByte(buf.Bytes(), '}')
+			if idx == -1 {
+				fmt.Fprintf(os.Stderr, "Could not find closing bracket in Extended JSON document\n")
+				os.Exit(1)
+			}
+			buf.Truncate(idx)  // Remove trailing "}"
+			buf.WriteByte(',') // Add comma to prepare for adding the next field
+		}
+
+		buf.WriteString(`"_meta":`)
+
+		err = enc.Encode(meta)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error marshaling to Extended JSON: %v\n", err)
 			os.Exit(1)
 		}
+
+		// Remove trailing newline added by Encode then add the closing "}"
+		// bracket and newline.
+		idx := bytes.LastIndexByte(buf.Bytes(), '\n')
+		if idx > 0 {
+			buf.Truncate(idx)
+		}
+		buf.WriteString("}\n")
 
 		ej := buf.Bytes()
 		buf.Reset()
@@ -109,221 +136,72 @@ func main() {
 	fmt.Println(count)
 }
 
-type JSONValueWriter struct {
+type SanitizedValueWriter struct {
 	bson.ValueWriter
 }
 
-func (jvw *JSONValueWriter) WriteDouble(v float64) error {
+func (svw *SanitizedValueWriter) WriteDouble(v float64) error {
 	if math.IsNaN(v) {
-		return jvw.WriteString("NaN")
+		return svw.WriteString("NaN")
 	}
 	if math.IsInf(v, +1) {
-		return jvw.WriteString("Infinity")
+		return svw.WriteString("Infinity")
 	}
 	if math.IsInf(v, -1) {
-		return jvw.WriteString("-Infinity")
+		return svw.WriteString("-Infinity")
 	}
-	return jvw.ValueWriter.WriteDouble(v)
+	return svw.ValueWriter.WriteDouble(v)
 }
 
-func (jvw *JSONValueWriter) WriteDateTime(dt int64) error {
+func (svw *SanitizedValueWriter) WriteDateTime(dt int64) error {
 	if dt < minTimeMilli {
 		dt = minTimeMilli
 	} else if dt > maxTimeMilli {
 		dt = maxTimeMilli
 	}
-	return jvw.ValueWriter.WriteDateTime(dt)
+	return svw.ValueWriter.WriteDateTime(dt)
 }
 
-func (jvw *JSONValueWriter) WriteObjectID(oid bson.ObjectID) error {
-	return jvw.ValueWriter.WriteString(oid.Hex())
+func (svw *SanitizedValueWriter) WriteObjectID(oid bson.ObjectID) error {
+	return svw.ValueWriter.WriteString(oid.Hex())
 }
 
-func (jvw *JSONValueWriter) WriteDocument() (bson.DocumentWriter, error) {
-	dw, err := jvw.ValueWriter.WriteDocument()
+func (svw *SanitizedValueWriter) WriteDocument() (bson.DocumentWriter, error) {
+	dw, err := svw.ValueWriter.WriteDocument()
 	if err != nil {
 		return nil, err
 	}
-	return &JSONDocumentWriter{DocumentWriter: dw}, nil
+	return &SanitizedDocumentWriter{DocumentWriter: dw}, nil
 }
 
-func (jvw *JSONValueWriter) WriteArray() (bson.ArrayWriter, error) {
-	aw, err := jvw.ValueWriter.WriteArray()
+func (svw *SanitizedValueWriter) WriteArray() (bson.ArrayWriter, error) {
+	aw, err := svw.ValueWriter.WriteArray()
 	if err != nil {
 		return nil, err
 	}
-	return &JSONArrayWriter{ArrayWriter: aw}, nil
+	return &SanitizedArrayWriter{ArrayWriter: aw}, nil
 }
 
-type JSONDocumentWriter struct {
+type SanitizedDocumentWriter struct {
 	bson.DocumentWriter
 }
 
-func (jdw *JSONDocumentWriter) WriteDocumentElement(key string) (bson.ValueWriter, error) {
-	vw, err := jdw.DocumentWriter.WriteDocumentElement(key)
+func (sdw *SanitizedDocumentWriter) WriteDocumentElement(key string) (bson.ValueWriter, error) {
+	vw, err := sdw.DocumentWriter.WriteDocumentElement(key)
 	if err != nil {
 		return nil, err
 	}
-	return &JSONValueWriter{ValueWriter: vw}, nil
+	return &SanitizedValueWriter{ValueWriter: vw}, nil
 }
 
-type JSONArrayWriter struct {
+type SanitizedArrayWriter struct {
 	bson.ArrayWriter
 }
 
-func (jaw *JSONArrayWriter) WriteArrayElement() (bson.ValueWriter, error) {
-	vw, err := jaw.ArrayWriter.WriteArrayElement()
+func (saw *SanitizedArrayWriter) WriteArrayElement() (bson.ValueWriter, error) {
+	vw, err := saw.ArrayWriter.WriteArrayElement()
 	if err != nil {
 		return nil, err
 	}
-	return &JSONValueWriter{ValueWriter: vw}, nil
+	return &SanitizedValueWriter{ValueWriter: vw}, nil
 }
-
-// type StringIDDocumentWriter struct {
-// 	bson.DocumentWriter
-// }
-
-// func (dw *StringIDDocumentWriter) WriteDocumentElement(key string) (bson.ValueWriter, error) {
-// 	vw, err := dw.DocumentWriter.WriteDocumentElement(key)
-// 	if err != nil {
-// 		return nil, err
-// 	}
-// 	if key == idProperty {
-// 		return NewJSONStringWriter(vw), nil
-// 	}
-
-// 	return &JSONValueWriter{ValueWriter: vw}, nil
-// }
-
-// func NewJSONStringWriter(vw bson.ValueWriter) *JSONStringValueWriter {
-// 	buf := new(bytes.Buffer)
-// 	return &JSONStringValueWriter{
-// 		vw:  vw,
-// 		buf: buf,
-// 	}
-// }
-
-// type JSONStringValueWriter struct {
-// 	vw  bson.ValueWriter
-// 	buf *bytes.Buffer
-// }
-
-// func (jsw *JSONStringValueWriter) WriteDocument() (bson.DocumentWriter, error) {
-// 	dw, err := jsw.vw.WriteDocument()
-// 	if err != nil {
-// 		return nil, err
-// 	}
-// 	return &StringIDDocumentWriter{dw}, nil
-// }
-
-// func (jsw *JSONStringValueWriter) WriteCodeWithScope(code string) (bson.DocumentWriter, error) {
-// 	panic("blah")
-// }
-
-// func (jsw *JSONStringValueWriter) WriteArray() (bson.ArrayWriter, error) {
-// 	panic("blah")
-// }
-
-// func (jsw *JSONStringValueWriter) WriteObjectID(oid bson.ObjectID) error {
-// 	return jsw.vw.WriteString(oid.Hex())
-// }
-
-// func (jsw *JSONStringValueWriter) WriteString(s string) error {
-// 	return jsw.vw.WriteString(s)
-// }
-
-// func (jsw *JSONStringValueWriter) WriteBinary(b []byte) error {
-// 	return jsw.writeAsJSON(b)
-// }
-
-// func (jsw *JSONStringValueWriter) WriteBinaryWithSubtype(b []byte, btype byte) error {
-// 	return jsw.writeAsJSON(bson.Binary{Subtype: btype, Data: b})
-// }
-
-// func (jsw *JSONStringValueWriter) WriteBoolean(b bool) error {
-// 	return jsw.writeAsJSON(b)
-// }
-
-// func (jsw *JSONStringValueWriter) WriteDBPointer(ns string, oid bson.ObjectID) error {
-// 	return jsw.writeAsJSON(bson.DBPointer{DB: ns, Pointer: oid})
-// }
-
-// func (jsw *JSONStringValueWriter) WriteDateTime(dt int64) error {
-// 	return jsw.writeAsJSON(bson.DateTime(dt))
-// }
-
-// func (jsw *JSONStringValueWriter) WriteDecimal128(d128 bson.Decimal128) error {
-// 	return jsw.writeAsJSON(d128)
-// }
-
-// func (jsw *JSONStringValueWriter) WriteDouble(f float64) error {
-// 	return jsw.writeAsJSON(f)
-// }
-
-// func (jsw *JSONStringValueWriter) WriteInt32(i int32) error {
-// 	return jsw.writeAsJSON(i)
-// }
-
-// func (jsw *JSONStringValueWriter) WriteInt64(i int64) error {
-// 	return jsw.writeAsJSON(i)
-// }
-// func (jsw *JSONStringValueWriter) WriteJavascript(code string) error {
-// 	return jsw.writeAsJSON(code)
-// }
-
-// func (jsw *JSONStringValueWriter) WriteMaxKey() error {
-// 	return jsw.writeAsJSON(bson.MaxKey{})
-// }
-
-// func (jsw *JSONStringValueWriter) WriteMinKey() error {
-// 	return jsw.writeAsJSON(bson.MinKey{})
-// }
-
-// func (jsw *JSONStringValueWriter) WriteNull() error {
-// 	return jsw.writeAsJSON(nil)
-// }
-
-// func (jsw *JSONStringValueWriter) WriteRegex(pattern, options string) error {
-// 	return jsw.writeAsJSON(bson.Regex{Pattern: pattern, Options: options})
-// }
-
-// func (jsw *JSONStringValueWriter) WriteSymbol(symbol string) error {
-// 	return jsw.writeAsJSON(symbol)
-// }
-
-// func (jsw *JSONStringValueWriter) WriteTimestamp(t, i uint32) error {
-// 	return jsw.writeAsJSON(bson.Timestamp{T: t, I: i})
-// }
-
-// func (jsw *JSONStringValueWriter) WriteUndefined() error {
-// 	return jsw.writeAsJSON(bson.Undefined{})
-// }
-
-// func (jsw *JSONStringValueWriter) writeAsJSON(v any) error {
-// 	j, err := json.Marshal(v)
-// 	if err != nil {
-// 		return err
-// 	}
-// 	return jsw.vw.WriteString(string(j))
-// }
-
-// type JSONStringDocumentWriter struct {
-// 	vw  bson.ValueWriter
-// 	buf *bytes.Buffer
-// }
-
-// func NewJSONStringDocumentWriter() *JSONStringDocumentWriter {
-// 	buf := new(bytes.Buffer)
-// 	return &JSONStringDocumentWriter{
-// 		vw:  bson.NewExtJSONValueWriter(buf, false, false),
-// 		buf: buf,
-// 	}
-// }
-
-// func (jdw *JSONStringDocumentWriter) WriteDocumentElement(key string) (bson.ValueWriter, error) {
-// 	return jdw.vw, nil
-// }
-
-// func (jdw *JSONStringDocumentWriter) WriteDocumentEnd() error {
-// 	return nil
-// }
